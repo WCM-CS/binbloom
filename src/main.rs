@@ -1,23 +1,44 @@
-use binbloom::{BinBloom, BitArena};
+use binbloom::AtomicBitMap;
 
 fn main() {
     println!("Hello, world!");
 
+    let mut bits = AtomicBitMap::new();
 
-    let mut bloom = BinBloom::<u8> { bitz: 0 };
+    bits.set(7);
+    println!("Bit 7 set? {:?}", bits.get(7)); // Some(true)
+    println!("Bit 4 set? {:?}", bits.get(4)); // Some(false)
+    println!("Bit 1 set? {:?}", bits.get(1)); // Some(false)
 
-    bloom.set(7);
 
-    println!("{:?}", bloom.get(7));
-    println!("{:?}", bloom.get(4));
-    println!("{:?}", bloom.get(1));
+    bits.clear(7);
+    println!("Bit 7 set? {:?}", bits.get(7)); // Some(true)
+    println!("Bit 4 set? {:?}", bits.get(4)); // Some(false)
+    println!("Bit 1 set? {:?}", bits.get(1)); // Some(false)
+    bits.set(7);
+
+
+    println!("Len: {}", bits.x);
+
+    bits.set(200);
+    println!("Len: {}", bits.x);
+
+
+    bits.clear(200);
+    //bits.reclamation();
+    println!("Len: {}", bits.x);
+
+
+    bits.set(500);
+    println!("Len: {}", bits.x);
+
+    bits.clear(500);
+    //bits.reclamation();
+    println!("Len: {}", bits.x);
+
+
 
 
 
 }
 
-
-struct v {
-    f: BinBloom::<u32>,
-    k: i64
-}
