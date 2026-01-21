@@ -2,21 +2,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct AtomicBitMap {
     arena: Vec<AtomicU64>,
-    pub x: usize
+    pub u64_count: usize
 }
 
+/* // if the bitmap were used more heavily and scaling in size frequently this would be better
+    arena: &'a [AtomicU64] // Overallocate initially, built once, reset occasionally, use a slice, backed by a custom bump allocator,
+
+*/
+
 impl AtomicBitMap {
-    pub fn new() -> Self {
-        Self {
-            arena: Vec::new(),
-            x: 0
-        }
-    }
+    pub fn new() -> Self { Self { arena: Vec::new(), u64_count: 0 } }
 
     // Reader
     pub fn get(&self, idx: usize) -> bool { // check if but is set, lock free, no contention
-        if let Some(i) = self.arena.get(get_bit(idx)) { // dont raw index here, cant ensure bounds, get returns an option
-            (i.load(Ordering::Relaxed) & (1 << (get_int(idx)))) != 0  // note some langauges dont like you calling nonatomic operation on atomic types,
+        if let Some(i) = self.arena.get(get_index(idx)) { // dont raw index here, cant ensure bounds, get returns an option
+            (i.load(Ordering::Relaxed) & (1 << (get_offset(idx)))) != 0  // note some langauges dont like you calling nonatomic operation on atomic types,
         } else {
             false
         }
@@ -25,33 +25,33 @@ impl AtomicBitMap {
     // Writers 
     pub fn set(&mut self, idx: usize) {
         self.capacity_regulator(idx);
-        self.arena[get_bit(idx)].fetch_or(1 << (get_int(idx)), Ordering::Relaxed);
+        self.arena[get_index(idx)].fetch_or(1 << (get_offset(idx)), Ordering::Relaxed);
     }
 
     pub fn clear(&mut self, idx: usize) {
         self.capacity_regulator(idx);
-        self.arena[get_bit(idx)].fetch_and(!(1 << (get_int(idx))), Ordering::Relaxed);
+        self.arena[get_index(idx)].fetch_and(!(1 << (get_offset(idx))), Ordering::Relaxed);
         self.reclamation(); // remove any empty integers
     }
 
     pub fn toggle(&mut self, idx: usize) { // be careful, this does not ensure you are toggling with any safeties, ideally just use clear and set instead
         self.capacity_regulator(idx);
-        self.arena[get_bit(idx)].fetch_xor(1 << (get_int(idx)), Ordering::Relaxed);
+        self.arena[get_index(idx)].fetch_xor(1 << (get_offset(idx)), Ordering::Relaxed);
         self.reclamation();
     }
 
     // Utilities
     fn capacity_regulator(&mut self, idx: usize) {
         let i = idx / 64; 
-        if i >= self.x {
+        if i >= self.u64_count {
             // scale arena aka, append a new Au64
             self.arena.resize_with(i + 1, || AtomicU64::new(0));
-            self.x = i + 1;
+            self.u64_count = i + 1;
         }
     }
 
     fn _check_bounds(&self, idx: usize) -> bool {
-        idx < self.x * 64  // buggy if valid range is unititialzied and accessed, will cause Undefined behavior, should return false but can return None instead
+        idx < self.u64_count * 64  // buggy if valid range is unititialzied and accessed, will cause Undefined behavior, should return false but can return None instead
     }
 
     pub fn reclamation(&mut self) { // reclaim free memory seqentially
@@ -61,18 +61,19 @@ impl AtomicBitMap {
             }
             self.arena.pop();
         }
-        self.x = self.arena.len();
+        self.u64_count = self.arena.len();
     }
 
 }
 
-fn get_int(idx: usize) -> usize {
+fn get_index(idx: usize) -> usize {
+    idx / 64
+}
+
+fn get_offset(idx: usize) -> usize {
     idx % 64
 }
 
-fn get_bit(idx: usize) -> usize {
-    idx / 64
-}
 
 
 

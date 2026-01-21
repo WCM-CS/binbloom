@@ -18,33 +18,33 @@ fn main() {
     bits.set(7);
 
 
-    println!("Len: {}", bits.x);
+    println!("Len: {}", bits.u64_count);
 
     bits.set(200);
-    println!("Len: {}", bits.x);
+    println!("Len: {}", bits.u64_count);
 
 
     bits.clear(200);
     //bits.reclamation();
-    println!("Len: {}", bits.x);
+    println!("Len: {}", bits.u64_count);
 
 
     bits.set(500);
-    println!("Len: {}", bits.x);
+    println!("Len: {}", bits.u64_count);
 
     bits.clear(500);
     //bits.reclamation();
-    println!("Len: {}", bits.x);
+    println!("Len: {}", bits.u64_count);
 
     println!("Bit 6000: {}", bits.get(6000));
-    println!("Bit len: {}", bits.x);
+    println!("Bit len: {}", bits.u64_count);
 
     bits.set(10_000);
     println!("Bit 10_000: {}", bits.get(10_000));
-    println!("Bit len: {}", bits.x);
+    println!("Bit len: {}", bits.u64_count);
 
     bits.toggle(10_000);
-    println!("Bit len: {}", bits.x);
+    println!("Bit len: {}", bits.u64_count);
 
 
 }
