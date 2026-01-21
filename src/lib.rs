@@ -1,172 +1,195 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{sync::atomic::{AtomicPtr, AtomicUsize, Ordering}};
 
-pub struct AtomicBitMap {
-    arena: Vec<AtomicU64>,
-    pub u64_count: usize
+pub struct AtomicBits {
+    data: AtomicPtr<SnapShot>  // current up to date atomic copy
 }
 
-/* // if the bitmap were used more heavily and scaling in size frequently this would be better
-    arena: &'a [AtomicU64] // Overallocate initially, built once, reset occasionally, use a slice, backed by a custom bump allocator,
+#[derive(Debug)]
+pub struct SnapShot {
+    data: Vec<u64>,   // Bitmap 
+    capacity: usize,  // number of u64 in the bitmap 
+    rc: AtomicUsize,  // number of readers this snapshot has currently (green thread readers)
+}
 
-*/
+impl Clone for SnapShot {
+    fn 
+    clone(&self) -> Self 
+    {
+        SnapShot { 
+            data: self.data.clone(), 
+            capacity: self.capacity, 
+            rc: AtomicUsize::new(0) 
+        }
+    }
+}
 
-impl AtomicBitMap {
-    pub fn new() -> Self { Self { arena: Vec::new(), u64_count: 0 } }
 
-    // Reader
-    pub fn get(&self, idx: usize) -> bool { // check if but is set, lock free, no contention
-        if let Some(i) = self.arena.get(get_index(idx)) { // dont raw index here, cant ensure bounds, get returns an option
-            (i.load(Ordering::Relaxed) & (1 << (get_offset(idx)))) != 0  // note some langauges dont like you calling nonatomic operation on atomic types,
-        } else {
+impl AtomicBits {
+    // Init
+    pub fn 
+    new() -> Self 
+    { 
+        let snapshot = Box::new(SnapShot { 
+            data: vec![0],
+            capacity: 1,
+            rc: AtomicUsize::new(0),
+        });
+
+        Self {
+            data: AtomicPtr::new(Box::into_raw(snapshot)) 
+        } 
+    }
+
+    // Reader 
+    pub fn 
+    read(&self, idx: usize) -> bool 
+    {
+        let bucket = get_bucket(idx); // which integer slot/bucket we reside in for the given input index
+        let offset = get_offset(idx); // what the actual offset is for the index within it's bucket
+
+        // loop until we ensure snapshot validity
+        let snapshot: &SnapShot = loop {
+            // Get a ref to the current snapshot
+            let ptr = self.data.load(Ordering::Acquire);  // current instance, raw ptr
+
+
+            // increment the rc
+            let rc_ref: &AtomicUsize = unsafe { &(*ptr).rc };
+            rc_ref.fetch_add(1, Ordering::Acquire);
+
+
+            if ptr == self.data.load(Ordering::Acquire) {
+                break unsafe { &*ptr };
+            } // return valid snapshot, under the single writer assumption this should only ever need to run once, and wont actually resolve certain UB derived from multi writer corruption, but can mitigate segfault risk if that does occur
+
+
+            rc_ref.fetch_sub(1, Ordering::Release);
+        };
+    
+
+        let result = if bucket >= snapshot.data.len() {
             false
+        } else {
+            snapshot.data[bucket] & (1 << offset) != 0
+        }; // handle out of bounds inputs, else reads data
+
+
+        snapshot.rc.fetch_sub(1, Ordering::Release);  // decrement reader count before we return the result
+
+
+        result
+    }
+
+    // Writers
+    pub fn 
+    set(&self, idx: usize) 
+    {
+        let bucket = get_bucket(idx);
+        let offset = get_offset(idx);
+
+
+        // Aquire atomic clone of snapshot
+        let old_ptr: *mut SnapShot = self.data.load(Ordering::Acquire);
+        let mut snapshot_copy: SnapShot = unsafe { (*old_ptr).clone() };
+
+        
+        if bucket >= snapshot_copy.data.len() {
+            snapshot_copy.data.resize(bucket + 1, 0);
+            snapshot_copy.capacity = bucket + 1;
+        } // capacity regulator
+
+
+        // set bit
+        snapshot_copy.data[bucket] |= 1 << offset;
+
+
+        // swap snapshot ptr
+        let new_ptr = Box::into_raw(Box::new(snapshot_copy));
+        let old_ptr = self.data.swap(new_ptr, Ordering::AcqRel);
+
+
+        while unsafe {&*old_ptr}.rc.load(Ordering::Acquire) > 0 {
+            std::thread::yield_now();
+        } // Listen for active reader of current/old to hit zero, yeilding thread to allow for multitasking in the meantime
+
+
+        unsafe {
+            let old_data = Box::from_raw(old_ptr);
+            drop(old_data);
         }
+
     }
 
-    // Writers 
-    pub fn set(&mut self, idx: usize) {
-        self.capacity_regulator(idx);
-        self.arena[get_index(idx)].fetch_or(1 << (get_offset(idx)), Ordering::Relaxed);
-    }
+    pub fn 
+    clear(&self, idx: usize) 
+    {
+        let bucket = get_bucket(idx);
+        let offset = get_offset(idx);
 
-    pub fn clear(&mut self, idx: usize) {
-        self.capacity_regulator(idx);
-        self.arena[get_index(idx)].fetch_and(!(1 << (get_offset(idx))), Ordering::Relaxed);
-        self.reclamation(); // remove any empty integers
-    }
 
-    pub fn toggle(&mut self, idx: usize) { // be careful, this does not ensure you are toggling with any safeties, ideally just use clear and set instead
-        self.capacity_regulator(idx);
-        self.arena[get_index(idx)].fetch_xor(1 << (get_offset(idx)), Ordering::Relaxed);
-        self.reclamation();
-    }
+        // Aquire atomic clone of snapshot
+        let old_ptr: *mut SnapShot = self.data.load(Ordering::Acquire);
+        let snapshot: &SnapShot = unsafe { &*old_ptr };
 
-    // Utilities
-    fn capacity_regulator(&mut self, idx: usize) {
-        let i = idx / 64; 
-        if i >= self.u64_count {
-            // scale arena aka, append a new Au64
-            self.arena.resize_with(i + 1, || AtomicU64::new(0));
-            self.u64_count = i + 1;
-        }
-    }
+        
+        if bucket >= snapshot.data.len() || (snapshot.data[bucket] & (1 << offset)) == 0 {
+            return ();
+        }  // check bounds and current state before mutating from 1 to zero
 
-    fn _check_bounds(&self, idx: usize) -> bool {
-        idx < self.u64_count * 64  // buggy if valid range is unititialzied and accessed, will cause Undefined behavior, should return false but can return None instead
-    }
 
-    pub fn reclamation(&mut self) { // reclaim free memory seqentially
-        while let Some(l) = self.arena.last() {
-            if l.load(Ordering::Relaxed) != 0 {
-                break;
+        // set bit
+        let mut snapshot_copy: SnapShot = snapshot.clone();
+        snapshot_copy.data[bucket] &= !(1 << offset);
+
+
+        {
+            while let Some(bucket) = snapshot_copy.data.last() {
+                if *bucket != 0 {
+                    break;
+                }
+
+                snapshot_copy.data.pop();
             }
-            self.arena.pop();
+            snapshot_copy.capacity = snapshot_copy.data.len();
+
+        } // reclamation
+        
+
+        // swap snapshot ptr
+        let new_ptr = Box::into_raw(Box::new(snapshot_copy));
+        let old_ptr = self.data.swap(new_ptr, Ordering::AcqRel);
+
+
+        while unsafe { &*old_ptr }.rc.load(Ordering::Acquire) > 0 {
+            std::thread::yield_now();
+        } // wait for thread safe guarentee
+
+
+        unsafe {
+            let old_data = Box::from_raw(old_ptr);
+            drop(old_data);
         }
-        self.u64_count = self.arena.len();
     }
 
+    pub fn
+    len(&self) -> usize 
+    {
+        let snap_ptr = self.data.load(Ordering::Relaxed);
+        let snapshot: &SnapShot = unsafe { &*snap_ptr };
+
+        snapshot.capacity
+    }
 }
 
-fn get_index(idx: usize) -> usize {
+fn 
+get_bucket(idx: usize) -> usize 
+{
     idx / 64
 }
 
-fn get_offset(idx: usize) -> usize {
+fn 
+get_offset(idx: usize) -> usize 
+{
     idx % 64
 }
-
-
-
-
-
-/*
-//use core::ops::*;
-pub struct BinBloom<N> {
-    pub bitz: N
-}
-
-pub trait BitArena {
-    type Repr;
-
-    const BITZ: u32;
-
-
-    fn set(&mut self, i: usize);
-    fn clear(&mut self, i: usize);
-    fn toggle(&mut self, i: usize);
-    fn get(&self, i: usize) -> bool;
-}
-
-
-pub trait UnsignedInt:
-    Copy
-    + Default
-    + BitAnd<Output = Self>
-    + BitOr<Output = Self>
-    + BitXor<Output = Self>
-    + Not<Output = Self>
-    + Shl<u32, Output = Self>
-    + Shr<u32, Output = Self>
-    + From<u8>
-    + PartialEq
-    {
-        const BITZ: u32;
-    }
-
-
-    impl UnsignedInt for u8 {
-        const BITZ: u32 = u8::BITS; 
-    }
-    impl UnsignedInt for u16 {
-        const BITZ: u32 = u16::BITS; 
-    }
-    impl UnsignedInt for u32 {
-        const BITZ: u32 = u32::BITS; 
-    }
-    impl UnsignedInt for u64 {
-        const BITZ: u32 = u64::BITS; 
-    }
-    impl UnsignedInt for u128 {
-        const BITZ: u32 = u128::BITS; 
-    }
-    impl UnsignedInt for usize {
-        const BITZ: u32 = usize::BITS; 
-    }
-
-
-    impl<N: UnsignedInt> BitArena for BinBloom<N> {
-        type Repr = N;
-
-        const BITZ: u32 = N::BITZ;
-        
-        #[inline]
-        fn set(&mut self, i: usize) {
-            debug_assert!(i < N::BITZ as usize);
-            self.bitz = self.bitz | (N::from(1) << i as u32); // bitwise or: |, combining masks
-        }
-
-        #[inline]
-        fn clear(&mut self, i: usize) {
-            debug_assert!(i < N::BITZ as usize);
-            self.bitz = self.bitz & !(N::from(1) << i as u32); // bitwise and not: inverted
-        }
-
-        #[inline]
-        fn toggle(&mut self, i: usize) {
-            debug_assert!(i < N::BITZ as usize);
-            self.bitz = self.bitz ^ (N::from(1) << i as u32); // xor: ^ 
-        }
-
-        #[inline]
-        fn get(&self, i: usize) -> bool {
-            debug_assert!(i < N::BITZ as usize);
-            (self.bitz & (N::from(1) << i as u32)) != N::default() // bitwise AND: &, Masking
-        }
-
-        
-    }
-
-
-
-
-*/
 
