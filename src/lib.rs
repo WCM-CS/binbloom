@@ -14,13 +14,12 @@ impl AtomicBitMap {
     }
 
     // Reader
-    pub fn get(&self, idx: usize) -> Option<bool> { // check if but is set, lock free, no contention
-        if !self.check_bounds(idx) {
-            return None
+    pub fn get(&self, idx: usize) -> bool { // check if but is set, lock free, no contention
+        if let Some(i) = self.arena.get(get_bit(idx)) { // dont raw index here, cant ensure bounds, get returns an option
+            (i.load(Ordering::Relaxed) & (1 << (get_int(idx)))) != 0  // note some langauges dont like you calling nonatomic operation on atomic types,
+        } else {
+            false
         }
-
-        let i = self.arena[get_bit(idx)].load(Ordering::Relaxed);
-        Some((i & (1 << (get_int(idx)))) != 0) // note some langauges dont like you calling nonatomic operation on atomic types,
     }
 
     // Writers 
@@ -51,8 +50,8 @@ impl AtomicBitMap {
         }
     }
 
-    fn check_bounds(&self, idx: usize) -> bool {
-        idx < self.x * 64
+    fn _check_bounds(&self, idx: usize) -> bool {
+        idx < self.x * 64  // buggy if valid range is unititialzied and accessed, will cause Undefined behavior, should return false but can return None instead
     }
 
     pub fn reclamation(&mut self) { // reclaim free memory seqentially

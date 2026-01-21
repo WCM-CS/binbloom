@@ -36,8 +36,15 @@ fn main() {
     //bits.reclamation();
     println!("Len: {}", bits.x);
 
+    println!("Bit 6000: {}", bits.get(6000));
+    println!("Bit len: {}", bits.x);
 
+    bits.set(10_000);
+    println!("Bit 10_000: {}", bits.get(10_000));
+    println!("Bit len: {}", bits.x);
 
+    bits.toggle(10_000);
+    println!("Bit len: {}", bits.x);
 
 
 }
