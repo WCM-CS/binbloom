@@ -1,15 +1,19 @@
 use std::{sync::atomic::{AtomicPtr, AtomicUsize, Ordering}};
 
+use tokio::sync::Notify;
+
 pub struct AtomicBits {
     data: AtomicPtr<SnapShot>  // current up to date atomic copy
 }
 
+
 #[derive(Debug)]
 pub struct SnapShot {
     data: Vec<u64>,   // Bitmap 
-    capacity: usize,  // number of u64 in the bitmap 
     rc: AtomicUsize,  // number of readers this snapshot has currently (green thread readers)
+    mercury: Notify
 }
+
 
 impl Clone for SnapShot {
     fn 
@@ -17,8 +21,8 @@ impl Clone for SnapShot {
     {
         SnapShot { 
             data: self.data.clone(), 
-            capacity: self.capacity, 
-            rc: AtomicUsize::new(0) 
+            rc: AtomicUsize::new(0), // reset rc, thus need to ensure all threads rc of old snapshot is 0 before drop
+            mercury: Notify::new(),
         }
     }
 }
@@ -31,8 +35,8 @@ impl AtomicBits {
     { 
         let snapshot = Box::new(SnapShot { 
             data: vec![0],
-            capacity: 1,
             rc: AtomicUsize::new(0),
+            mercury:Notify::new()
         });
 
         Self {
@@ -55,7 +59,7 @@ impl AtomicBits {
 
             // increment the rc
             let rc_ref: &AtomicUsize = unsafe { &(*ptr).rc };
-            rc_ref.fetch_add(1, Ordering::Acquire);
+            rc_ref.fetch_add(1, Ordering::AcqRel);
 
 
             if ptr == self.data.load(Ordering::Acquire) {
@@ -74,14 +78,16 @@ impl AtomicBits {
         }; // handle out of bounds inputs, else reads data
 
 
-        snapshot.rc.fetch_sub(1, Ordering::Release);  // decrement reader count before we return the result
-
+        if snapshot.rc.fetch_sub(1, Ordering::Release) == 1 {  // decrement reader count before we return the result
+            snapshot.mercury.notify_one();
+        } // notify waiting threads that the final reader has concluded its work
 
         result
     }
 
+
     // Writers
-    pub fn 
+    pub async fn 
     set(&self, idx: usize) 
     {
         let bucket = get_bucket(idx);
@@ -90,12 +96,20 @@ impl AtomicBits {
 
         // Aquire atomic clone of snapshot
         let old_ptr: *mut SnapShot = self.data.load(Ordering::Acquire);
-        let mut snapshot_copy: SnapShot = unsafe { (*old_ptr).clone() };
+        debug_assert!(!old_ptr.is_null());
+        //let mut snapshot_copy: SnapShot = unsafe { (*old_ptr).clone() };
+        let snapshot: &SnapShot = unsafe { &*old_ptr };
+
+        if bucket < snapshot.data.len() && (snapshot.data[bucket] & (1 << offset)) != 0 {
+            return ();
+        }
+
+
+        let mut snapshot_copy: SnapShot = snapshot.clone();
 
         
         if bucket >= snapshot_copy.data.len() {
             snapshot_copy.data.resize(bucket + 1, 0);
-            snapshot_copy.capacity = bucket + 1;
         } // capacity regulator
 
 
@@ -106,12 +120,21 @@ impl AtomicBits {
         // swap snapshot ptr
         let new_ptr = Box::into_raw(Box::new(snapshot_copy));
         let old_ptr = self.data.swap(new_ptr, Ordering::AcqRel);
+        //let old_snapshot = unsafe { &*old_ptr };
 
 
+        while unsafe {&*old_ptr}.rc.load(Ordering::Acquire) != 0 {
+            unsafe {&*old_ptr}.mercury.notified().await;
+        } // once last thread notifies the vallet this work continues
+        /*
         while unsafe {&*old_ptr}.rc.load(Ordering::Acquire) > 0 {
             std::thread::yield_now();
         } // Listen for active reader of current/old to hit zero, yeilding thread to allow for multitasking in the meantime
 
+        
+         */
+        
+        // can this starve aka writes starve from heavy red load?
 
         unsafe {
             let old_data = Box::from_raw(old_ptr);
@@ -120,7 +143,7 @@ impl AtomicBits {
 
     }
 
-    pub fn 
+    pub async fn 
     clear(&self, idx: usize) 
     {
         let bucket = get_bucket(idx);
@@ -129,6 +152,8 @@ impl AtomicBits {
 
         // Aquire atomic clone of snapshot
         let old_ptr: *mut SnapShot = self.data.load(Ordering::Acquire);
+        debug_assert!(!old_ptr.is_null());
+
         let snapshot: &SnapShot = unsafe { &*old_ptr };
 
         
@@ -150,7 +175,6 @@ impl AtomicBits {
 
                 snapshot_copy.data.pop();
             }
-            snapshot_copy.capacity = snapshot_copy.data.len();
 
         } // reclamation
         
@@ -158,11 +182,17 @@ impl AtomicBits {
         // swap snapshot ptr
         let new_ptr = Box::into_raw(Box::new(snapshot_copy));
         let old_ptr = self.data.swap(new_ptr, Ordering::AcqRel);
+        //let old_snapshot = unsafe { &*old_ptr };
 
-
-        while unsafe { &*old_ptr }.rc.load(Ordering::Acquire) > 0 {
+/*
+while unsafe { &*old_ptr }.rc.load(Ordering::Acquire) > 0 {
             std::thread::yield_now();
         } // wait for thread safe guarentee
+ */
+        while unsafe {&*old_ptr}.rc.load(Ordering::Acquire) != 0 {
+            unsafe {&*old_ptr}.mercury.notified().await;
+        } // once last thread notifies the vallet this work continues
+        
 
 
         unsafe {
@@ -176,8 +206,8 @@ impl AtomicBits {
     {
         let snap_ptr = self.data.load(Ordering::Relaxed);
         let snapshot: &SnapShot = unsafe { &*snap_ptr };
-
-        snapshot.capacity
+        
+        snapshot.data.len()
     }
 }
 
